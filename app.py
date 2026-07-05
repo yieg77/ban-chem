@@ -1536,10 +1536,11 @@ def _build_summary_tables(ws, hazard_df):
 	end_row = start_row + len(hazard_df) - 1
 	summary_start_row = end_row + 2
 
+	excluded_result_values = {'공단 MSDS 없음', '영업비밀', '심의중'}
 	analyzed_count = sum(
 		1
 		for r in range(start_row, end_row + 1)
-		if ws.cell(row=r, column=HAZARD_ORDER.index('결과없음') + 1).value != '공단 MSDS 없음'
+		if str(ws.cell(row=r, column=HAZARD_ORDER.index('결과없음') + 1).value or '').strip() not in excluded_result_values
 	)
 
 	ws[f'D{summary_start_row}'] = '유해성'
@@ -1643,8 +1644,8 @@ def _build_summary_tables(ws, hazard_df):
 	analyzed_count2 = 0
 	col_result_idx = HAZARD_ORDER.index('결과없음') + 1
 	for r in range(start_row, end_row + 1):
-		val = ws.cell(row=r, column=col_result_idx).value
-		if val != '공단 MSDS 없음':
+		val = str(ws.cell(row=r, column=col_result_idx).value or '').strip()
+		if val not in excluded_result_values:
 			analyzed_count2 += 1
 
 	c = ws.cell(row=table3_start_row, column=summary_start_col - 1)
