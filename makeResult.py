@@ -281,11 +281,25 @@ def query_detail11(session, service_key, chem_id):
 
 # ----------------- 단일 화학물질 처리용 워커 함수 (멀티스레딩 지원) -----------------
 def process_single_chemical(idx, row, session, service_key):
-    cas = row[2]
+    # pandas 변환 과정에서 생성될 수 있는 'nan', 'None' 문자열 방어
+    cas_raw = str(row[2]).strip()
+    if cas_raw.lower() in ['nan', 'none', 'null']:
+        cas = ''
+    else:
+        cas = cas_raw
+
     id_num = row[0]
     name = row[1]
     result = {'#': id_num, '물질명칭': name, 'CAS No.': cas}
     unknown_cols = set()
+    
+    # 💥 [CAS No. 예외 처리 추가] 💥
+    if not cas:  # CAS No가 아예 비어있는 경우
+        result['결과없음'] = '영업비밀'
+        return idx, result, unknown_cols
+    elif '심의중' in cas:  # 문자열 내에 '심의중'이 포함된 경우
+        result['결과없음'] = '심의중'
+        return idx, result, unknown_cols
     
     try:
         res_id = session.get(
@@ -748,7 +762,7 @@ def _write_excel_results(wb, ws, hazard_df):
         for cell in row:
             cell.fill = fill_header
             cell.font = default_font
-            if cell.value in ['발암성','생식독성','CMR','급성독성','피부/눈 자극성','특정표적장기 독성','수생환경 유해성','인화성','연간사용·판매량']:
+            if cell.value in ['발암성','생식독성','CMR','급성 독성','피부/눈 자극성','특정표적장기 독성','수생환경 유해성','인화성','연간사용·판매량']:
                 cell.font = bold_font
     for r_idx, row in hazard_df.iterrows():
         excel_row = r_idx + 2
@@ -805,7 +819,7 @@ def _build_summary_tables(ws, hazard_df):
         cell = ws[f"{col_letter}{summary_start_row}"]
         cell.value = col_name
         cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        cell.font = bold_font if col_name in ['발암성','생식독성','CMR','급성독성','피부/눈 자극성','특정표적장기 독성','수생환경 유해성','인화성'] else default_font
+        cell.font = bold_font if col_name in ['발암성','생식독성','CMR','급성 독성','피부/눈 자극성','특정표적장기 독성','수생환경 유해성','인화성'] else default_font
         cell.border = thin_border
         cell.fill = fill_header
     row_labels = ['구분1', '1A', '1B', '구분2', '구분3', '구분4', '기타구분', '유해물질수', '분석물질수', '유해물질비율']
