@@ -10,6 +10,8 @@
 주의
 - 기존 createForm/makeResult의 데이터 규칙을 유지하기 위해 핵심 로직을 그대로 재사용했다.
 - 이해를 돕기 위해 주요 흐름에 상세 주석을 추가했다.
+
+Streamlit 버전 : 1.58
 """
 
 # ---------------------------
@@ -138,14 +140,14 @@ SERVICE_KEY = st.secrets['SERVICE_KEY']
 # ---------------------------
 QUANTITY_CODE_MAPPING = {
 	'01': '0.1미만',
-	'02': '0.1 ~ 0.5',
-	'03': '0.5 ~ 1.0',
-	'04': '1 ~ 2.5',
-	'05': '2.5 ~ 5.0',
-	'06': '5 ~ 20',
-	'07': '20 ~ 200',
-	'08': '200 ~ 1,000',
-	'09': '1,000 ~ 5,000',
+	'02': '0.1~0.5',
+	'03': '0.5~1.0',
+	'04': '1~2.5',
+	'05': '2.5~5.0',
+	'06': '5~20',
+	'07': '20~200',
+	'08': '200~1,000',
+	'09': '1,000~5,000',
 	'10': '5,000이상',
 }
 
@@ -1567,9 +1569,13 @@ def _build_summary_tables(ws, hazard_df):
 
 		for r in range(start_row, end_row + 1):
 			val = ws.cell(row=r, column=col_idx).value
-			if val is None or str(val).strip() == '':
+			if val is None or pd.isna(val):
+				continue
+			if str(val).strip() == '':
 				continue
 			val_str = str(val).strip()
+			if val_str.lower() in {'nan', 'none', 'null'}:
+				continue
 
 			if hazard in cmr_agg_cols:
 				label_map = {'1A': '1A', '1B': '1B', '2': '구분2'}
@@ -1953,6 +1959,36 @@ def _render_status_cell(idx, text_placeholder, bar_placeholder):
 		bar_placeholder.progress(0.0)
 
 
+def _clear_search_runtime_state(clear_keyword=False):
+	"""검색/다운로드 관련 세션 상태를 정리한다."""
+	prev_results = st.session_state.get('search_results', [])
+	for i in range(len(prev_results)):
+		st.session_state[f'chk_{i}'] = False
+		st.session_state[f'status_{i}'] = ''
+		st.session_state[f'progress_{i}'] = 0
+		st.session_state[f'filename_{i}'] = ''
+
+	if clear_keyword:
+		st.session_state['keyword_input'] = ''
+
+	st.session_state['search_results'] = []
+	st.session_state['current_page'] = 1
+	st.session_state['current_page_indices'] = []
+	st.session_state['search_success_message'] = None
+	st.session_state['last_search_keywords'] = None
+	st.session_state['select_all_state'] = False
+	st.session_state['select_all_main'] = False
+	st.session_state['files'] = {}
+	st.session_state['page_downloads'] = {}
+	st.session_state['file_generation_started'] = False
+	st.session_state['active_generation_indices'] = []
+	st.session_state['file_generation_completed'] = False
+	st.session_state['download_bytes_data'] = None
+	st.session_state['download_filename'] = ''
+	st.session_state['download_mime_type'] = 'application/zip'
+	st.session_state['download_completed'] = False
+
+
 def main_ui(tab_mode=False):
 	"""검색 UI는 createForm과 동일, 생성 동작만 통합 파이프라인으로 연결한다."""
 	_init_session_state()
@@ -2319,30 +2355,7 @@ def main_ui(tab_mode=False):
 	""", unsafe_allow_html=True)
 
 	if st.session_state.get('reset_requested', False):
-		prev_results = st.session_state.get('search_results', [])
-		for i in range(len(prev_results)):
-			st.session_state[f'chk_{i}'] = False
-			st.session_state[f'status_{i}'] = ''
-			st.session_state[f'progress_{i}'] = 0
-			st.session_state[f'filename_{i}'] = ''
-
-		st.session_state['keyword_input'] = ''
-		st.session_state['search_results'] = []
-		st.session_state['current_page'] = 1
-		st.session_state['current_page_indices'] = []
-		st.session_state['search_success_message'] = None
-		st.session_state['last_search_keywords'] = None
-		st.session_state['select_all_state'] = False
-		st.session_state['select_all_main'] = False
-		st.session_state['files'] = {}
-		st.session_state['page_downloads'] = {}
-		st.session_state['file_generation_started'] = False
-		st.session_state['active_generation_indices'] = []
-		st.session_state['file_generation_completed'] = False
-		st.session_state['download_bytes_data'] = None
-		st.session_state['download_filename'] = ""
-		st.session_state['download_mime_type'] = "application/zip"
-		st.session_state['download_completed'] = False
+		_clear_search_runtime_state(clear_keyword=True)
 		st.session_state['reset_requested'] = False
 
 	# [상단 검색 카드] createForm과 동일 구조
@@ -2377,19 +2390,7 @@ def main_ui(tab_mode=False):
 
 	# 검색 실행
 	if search_button_pressed:
-		st.session_state['search_results'] = []
-		st.session_state['current_page'] = 1
-		st.session_state['current_page_indices'] = []
-		st.session_state['search_success_message'] = None
-		st.session_state['files'] = {}
-		st.session_state['page_downloads'] = {}
-		st.session_state['file_generation_started'] = False
-		st.session_state['active_generation_indices'] = []
-		st.session_state['file_generation_completed'] = False
-		st.session_state['download_bytes_data'] = None
-		st.session_state['download_filename'] = ""
-		st.session_state['download_mime_type'] = "application/zip"
-		st.session_state['download_completed'] = False
+		_clear_search_runtime_state(clear_keyword=False)
 
 		if not keyword_input.strip():
 			search_msg_container.markdown('<p style="color: #e53e3e; font-size: 15px; font-weight: 500; margin-top: -10px; margin-bottom: 10px;">검색어를 입력하세요.</p>', unsafe_allow_html=True)
