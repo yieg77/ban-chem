@@ -72,6 +72,14 @@ HEADERS = {
 
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 ASYNC_MAX_CONCURRENCY = 30
+DEFAULT_SEARCH_YEAR = 2022
+DEFAULT_SEARCH_YEAR_LABEL = '2022년'
+ICIS_DYNAMIC_HEADER_FALLBACK = [
+	'물질명칭', 'CAS No.',
+	'인체등유해성물질', '제한물질2', '금지물질2', '허가물질2', '사고대비물질2', '중점관리물질2',
+	'금지·허가물질2', '노출·허용기준물질2', '직업환경측정물질등2', '위험물2', '독성가스2',
+	'연간입고량', '연간사용·판매량', '[11번] 특정표적장기 독성(1회 노출)', '[11번] 특정표적장기 독성(반복 노출)',
+]
 
 
 def request_with_retry(session, method, url, *, timeout=20, max_retries=3, backoff_base=0.6, retry_status_codes=None, **kwargs):
@@ -232,7 +240,7 @@ def fetch_all_search_results(session, company_name, search_year=None):
 	items = []
 	page_no = 1
 	while True:
-		use_year = '2022' if search_year is None else search_year
+		use_year = normalize_search_year(search_year)
 		search_json = fetch_search_results(session, company_name, page_no=page_no, search_year=use_year)
 
 		if search_json.get('result') != 'SUCCESS':
@@ -255,7 +263,7 @@ def fetch_all_search_results(session, company_name, search_year=None):
 def fetch_detail_page(session, bplc_id, search_year=None):
 	"""선택한 업체의 상세 페이지(화학물질 취급현황 포함 HTML)를 가져온다."""
 	form_data = {
-		'searchYear': '2022' if search_year is None else search_year,
+		'searchYear': normalize_search_year(search_year),
 		'bplcId': bplc_id,
 		'streNo': '',
 	}
@@ -269,6 +277,67 @@ def sanitize_filename(name):
 	cleaned = re.sub(r'[<>:"/\\|?*\n\r\t]+', '_', name)
 	cleaned = cleaned.strip().rstrip('.')
 	return cleaned or 'detail'
+
+
+def normalize_search_year(search_year):
+	"""검색 조건 and 파일명에 쓸 연도 값을 4자리 문자열로 정규화한다."""
+	if search_year in (None, ''):
+		return str(DEFAULT_SEARCH_YEAR)
+	year_text = str(search_year).strip()
+	match = re.search(r'(19\d{2}|20\d{2})', year_text)
+	if match:
+		return match.group(1)
+	return year_text
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_search_year_options():
+	"""ICIS 상세검색 화면의 연도 드롭다운 항목을 그대로 읽어온다."""
+	try:
+		session = requests.Session()
+		res = request_with_retry(session, 'GET', SEARCH_PAGE_URL, headers=HEADERS, timeout=20)
+		res.raise_for_status()
+		html_text = res.text
+		select_match = re.search(
+			r'<select[^>]*(?:name|id)\s*=\s*["\']searchYear["\'][^>]*>(.*?)</select>',
+			html_text,
+			re.S | re.I,
+		)
+		if select_match:
+			option_pairs = re.findall(
+				r'<option[^>]*value\s*=\s*["\']?([^"\'<>\s]+)["\']?[^>]*>(.*?)</option>',
+				select_match.group(1),
+				re.S | re.I,
+			)
+			options = []
+			for value, label in option_pairs:
+				label_text = re.sub(r'<[^>]+>', '', label).strip()
+				if value and label_text:
+					options.append({'label': label_text, 'value': value.strip()})
+			if options:
+				return options
+	except Exception:
+		pass
+	return [
+		{'label': '2022년', 'value': '2022'},
+		{'label': '2020년', 'value': '2020'},
+		{'label': '2018년', 'value': '2018'},
+		{'label': '2016년', 'value': '2016'},
+		{'label': '2014년', 'value': '2014'},
+	]
+
+
+def get_default_search_year_label():
+	options = get_search_year_options()
+	if options:
+		return options[0]['label']
+	return DEFAULT_SEARCH_YEAR_LABEL
+
+
+def build_year_prefixed_filename(base_name, search_year, extension):
+	"""연도 접두사를 붙인 안전한 파일명을 만든다."""
+	year_text = normalize_search_year(search_year)
+	return f'[{year_text}]_{sanitize_filename(base_name)}.{extension}'
 
 
 def extract_region_from_address(address):
@@ -333,9 +402,8 @@ def select_section_table(html_text, section_title='3. 화학물질 취급현황'
 		return tables[table_index - 1]
 	return tables[-1]
 
-
 class TableHTMLParser(HTMLParser):
-	"""테이블 셀 텍스트를 2차원 리스트로 추출하는 단순 파서."""
+	"""테이블 셀 텍스트를 2차원 리스트로 추출하는 그리드 기반 파서 (rowspan/colspan 완벽 대응)."""
 
 	def __init__(self):
 		super().__init__()
@@ -344,10 +412,17 @@ class TableHTMLParser(HTMLParser):
 		self.in_tr = False
 		self.in_cell = False
 		self.current_cell = ''
-		self.current_row = []
-		self.rows = []
+		self.current_checkbox_state = None
+		
+		self.grid = {}
+		self.row_idx = -1
+		self.col_idx = 0
+		self.rowspan = 1
+		self.colspan = 1
 
 	def handle_starttag(self, tag, attrs):
+		attrs_dict = {k.lower(): (v or '') for k, v in attrs}
+		
 		if tag == 'table':
 			if self.in_table:
 				self.table_depth += 1
@@ -355,39 +430,118 @@ class TableHTMLParser(HTMLParser):
 				self.in_table = True
 				self.table_depth = 1
 
-		if self.in_table and tag == 'tr':
+		# 내부의 중첩 테이블은 무시하고 최상위 테이블 구조만 유지합니다.
+		if self.in_table and tag == 'tr' and self.table_depth == 1:
 			self.in_tr = True
-			self.current_row = []
+			self.row_idx += 1
+			self.col_idx = 0
 
-		if self.in_tr and tag in ('td', 'th'):
+		if self.in_tr and tag in ('td', 'th') and self.table_depth == 1:
 			self.in_cell = True
 			self.current_cell = ''
+			self.current_checkbox_state = None
+			
+			# 이미 병합(rowspan/colspan)으로 채워진 그리드 칸은 건너뜁니다.
+			while (self.row_idx, self.col_idx) in self.grid:
+				self.col_idx += 1
+			
+			try:
+				self.rowspan = int(attrs_dict.get('rowspan', 1))
+			except ValueError:
+				self.rowspan = 1
+			try:
+				self.colspan = int(attrs_dict.get('colspan', 1))
+			except ValueError:
+				self.colspan = 1
+				
+			cls_text = attrs_dict.get('class', '').lower()
+			if 'chk_on' in cls_text or ('on' in cls_text and 'chk' in cls_text):
+				self.current_checkbox_state = '▣'
+			elif 'chk_off' in cls_text or ('off' in cls_text and 'chk' in cls_text):
+				self.current_checkbox_state = '▢'
+
+		if self.in_cell and tag in ('input', 'img'):
+			input_type = attrs_dict.get('type', '').lower()
+			src_text = attrs_dict.get('src', '').lower()
+			alt_text = attrs_dict.get('alt', '').lower()
+			
+			if tag == 'input' and input_type == 'checkbox':
+				self.current_checkbox_state = '▣' if 'checked' in attrs_dict else '▢'
+			else:
+				if 'checked' in attrs_dict or '체크' in alt_text or '선택됨' in alt_text or 'checked' in alt_text:
+					self.current_checkbox_state = '▣'
+				elif '미체크' in alt_text or 'unchecked' in alt_text or '선택안됨' in alt_text:
+					self.current_checkbox_state = '▢'
+				# 💡 핵심 수정: .png 처럼 주소에 n이나 y가 단순히 포함된 것을 오인식하지 않도록 정확한 키워드만 판정합니다.
+				elif any(kw in src_text for kw in ['chk_on', 'chk1', 'check_on', 'icon_check']):
+					self.current_checkbox_state = '▣'
+				elif any(kw in src_text for kw in ['chk_off', 'chk0', 'check_off', 'icon_uncheck']):
+					self.current_checkbox_state = '▢'
 
 	def handle_data(self, data):
 		if self.in_cell:
 			self.current_cell += data
 
 	def handle_endtag(self, tag):
-		if tag in ('td', 'th') and self.in_cell:
+		if tag in ('td', 'th') and self.in_cell and self.table_depth == 1:
 			text = unescape(self.current_cell).strip()
-			self.current_row.append(' '.join(text.split()))
+			normalized_text = ' '.join(text.split())
+			
+			if any(c in normalized_text for c in ['☑', '☒', '✓', '✔', '▣', '■', '체크됨']):
+				self.current_checkbox_state = '▣'
+			# 💡 핵심 수정: 물질명(Hexane 등)의 일부 x가 인식되지 않도록, 정확하게 'x' 한 글자일 때만 판정합니다.
+			elif any(c in normalized_text for c in ['☐', '□', '▢', '✗', '미체크']) or normalized_text.lower() == 'x':
+				self.current_checkbox_state = '▢'
+
+			final_val = ''
+			if self.current_checkbox_state is not None:
+				final_val = self.current_checkbox_state
+			elif normalized_text:
+				final_val = normalized_text
+
+			# Grid 채우기 (rowspan, colspan 반영)
+			for r in range(self.row_idx, self.row_idx + self.rowspan):
+				for c in range(self.col_idx, self.col_idx + self.colspan):
+					self.grid[(r, c)] = final_val
+			
+			self.col_idx += self.colspan
 			self.in_cell = False
-		elif tag == 'tr' and self.in_tr:
-			if self.current_row:
-				self.rows.append(self.current_row)
+			self.current_checkbox_state = None
+			
+		elif tag == 'tr' and self.in_tr and self.table_depth == 1:
 			self.in_tr = False
 		elif tag == 'table' and self.in_table:
 			self.table_depth -= 1
 			if self.table_depth <= 0:
 				self.in_table = False
 
+	@property
+	def rows(self):
+		if not self.grid:
+			return []
+		max_r = max(r for r, c in self.grid.keys())
+		max_c = max(c for r, c in self.grid.keys())
+		
+		result = []
+		for r in range(max_r + 1):
+			row_data = []
+			for c in range(max_c + 1):
+				row_data.append(self.grid.get((r, c), ''))
+			result.append(row_data)
+		return result
 
 def parse_table_html(table_html):
 	"""HTML 문자열에서 테이블을 파싱해 행 리스트로 반환한다.
 
-	1) pandas.read_html 우선 시도(HTML 구조 변경에 상대적으로 강함)
-	2) 실패 시 기존 커스텀 파서로 fallback
+	1) 커스텀 파서 우선(체크박스 checked/unchecked 보존)
+	2) 결과가 빈 경우 pandas.read_html fallback
 	"""
+	parser = TableHTMLParser()
+	parser.feed(table_html)
+	rows = parser.rows
+	if rows:
+		return rows
+
 	try:
 		tables = pd.read_html(io.StringIO(table_html), header=None)
 		if tables:
@@ -401,24 +555,185 @@ def parse_table_html(table_html):
 	except Exception:
 		pass
 
-	parser = TableHTMLParser()
-	parser.feed(table_html)
-	return parser.rows[2:] if len(parser.rows) > 2 else parser.rows
+	return []
+
+
+def extract_table_headers_from_html(table_html):
+	"""ICIS 테이블의 실제 헤더를 크롤링해서 1차원 헤더로 정규화한다."""
+	def _clean(v):
+		return ' '.join(str(v).split()).strip()
+
+	def _extract_headers_from_tr_rows(html_text):
+		tr_blocks = re.findall(r'<tr[^>]*>.*?</tr>', html_text, re.S | re.I)
+		header_trs = [tr for tr in tr_blocks if re.search(r'<th\b', tr, re.I)]
+		if not header_trs:
+			return []
+
+		# 제목 2행 구조를 우선 처리한다.
+		target_trs = header_trs[:2]
+		row_count = len(target_trs)
+		grid = [[] for _ in range(max(2, row_count))]
+
+		def _ensure_width(row_idx, width):
+			while len(grid[row_idx]) < width:
+				grid[row_idx].append('')
+
+		for r_idx, tr in enumerate(target_trs):
+			cells = re.findall(r'<t[hd][^>]*>.*?</t[hd]>', tr, re.S | re.I)
+			col = 0
+			for cell_html in cells:
+				open_tag_match = re.match(r'<t[hd]([^>]*)>', cell_html, re.S | re.I)
+				attrs = open_tag_match.group(1) if open_tag_match else ''
+
+				colspan_match = re.search(r'colspan\s*=\s*["\']?(\d+)', attrs, re.I)
+				rowspan_match = re.search(r'rowspan\s*=\s*["\']?(\d+)', attrs, re.I)
+				colspan = int(colspan_match.group(1)) if colspan_match else 1
+				rowspan = int(rowspan_match.group(1)) if rowspan_match else 1
+
+				# 현재 행에서 이미 점유된 칸을 건너뛴다.
+				while col < len(grid[r_idx]) and grid[r_idx][col] != '':
+					col += 1
+
+				text = re.sub(r'<[^>]+>', ' ', cell_html)
+				text = _clean(unescape(text))
+
+				for rr in range(r_idx, min(r_idx + rowspan, len(grid))):
+					_ensure_width(rr, col + colspan)
+					for cc in range(col, col + colspan):
+						grid[rr][cc] = text
+
+				col += colspan
+
+		max_cols = max((len(r) for r in grid), default=0)
+		if max_cols == 0:
+			return []
+
+		# 2행이면 아래쪽 제목을 우선 사용한다.
+		headers = []
+		for c in range(max_cols):
+			top = grid[0][c] if c < len(grid[0]) else ''
+			bottom = grid[1][c] if c < len(grid[1]) else ''
+			if row_count >= 2:
+				headers.append(bottom if bottom else top)
+			else:
+				headers.append(top)
+
+		return headers
+
+	headers_from_html = _extract_headers_from_tr_rows(table_html)
+	if headers_from_html:
+		return headers_from_html
+
+	# 2단 헤더(상위/하위)가 있는 경우 하위 헤더를 우선 사용한다.
+	try:
+		tables = pd.read_html(io.StringIO(table_html), header=[0, 1])
+		if tables:
+			df = tables[0]
+			if isinstance(df.columns, pd.MultiIndex):
+				headers = []
+				for top, sub in df.columns.tolist():
+					top_s = _clean(top)
+					sub_s = _clean(sub)
+					if sub_s and not sub_s.lower().startswith('unnamed'):
+						headers.append(sub_s)
+					else:
+						headers.append(top_s)
+				if headers:
+					return headers
+	except Exception:
+		pass
+
+	# 단일 헤더 테이블 fallback
+	try:
+		tables = pd.read_html(io.StringIO(table_html), header=0)
+		if tables:
+			df = tables[0]
+			headers = [_clean(c) for c in df.columns.tolist()]
+			if headers:
+				return headers
+	except Exception:
+		pass
+
+	return []
 
 
 def _is_header_only_row(row):
 	"""헤더 키워드만 반복되는 잡음 행인지 판단한다."""
+	# 💡 핵심: 띄어쓰기나 오탈자에 강하도록 핵심 키워드 단위로 쪼개서 판별합니다.
 	header_keywords = [
-		'물질명칭', 'CAS', 'CAS No', 'CAS No.', '제품', '제품명', '인체등유해성물질',
-		'제한물질2', '금지물질2', '허가물질2', '사고대비물질2', '중점관리물질2',
-		'금지·허가물질2', '노출·허용기준물질2', '직업환경측정물질등2', '위험물2',
-		'독성가스2', '연간입고량', '연간사용·판매량',
+		'물질명칭', 'cas', '제품', '인체', '유해', '유독', '제한', '금지', '사고대비', 
+		'노출', '허용', '작업', '직업', '위험', '독성', '허가', '중점관리', 
+		'입고', '판매', '사용', '특정표적', '장기'
 	]
-	normalized_keywords = [kw.lower().replace('.', '').replace('·', ' ') for kw in header_keywords]
-	cells = [cell.strip().lower().replace('.', '').replace('·', ' ') for cell in row if cell.strip()]
+
+	def _normalize_cell_for_header(cell):
+		c = str(cell).strip().lower().replace(' ', '').replace('.', '').replace('·', '')
+		c = c.replace('▣', '').replace('▢', '').strip()
+		if c.startswith('checked'):
+			c = c.replace('checked', '').strip()
+		if c.startswith('unchecked'):
+			c = c.replace('unchecked', '').strip()
+		return c
+
+	# 빈칸 및 체크박스 기호만 있는 셀은 판별 대상에서 제외합니다.
+	cells = [_normalize_cell_for_header(cell) for cell in row if str(cell).strip()]
+	cells = [c for c in cells if c]
+	
 	if not cells:
 		return False
-	return all(any(nk == cell or nk in cell or cell in nk for nk in normalized_keywords) for cell in cells)
+		
+	# 💡 핵심: 살아남은 텍스트 셀 중 70% 이상이 헤더 키워드를 포함하면 무조건 제목행(잡음)으로 판별하여 삭제합니다.
+	match_count = sum(1 for cell in cells if any(kw in cell for kw in header_keywords))
+	return (match_count / len(cells)) >= 0.7
+
+def _row_has_cas_header_token(row):
+	"""행에 CAS 헤더 토큰이 있는지(대소문자/기호 무시) 판정한다."""
+	joined = ''.join(str(cell) for cell in row if cell is not None)
+	norm = re.sub(r'[\s\.\-_:;\[\]\(\)]', '', joined).lower()
+	return 'cas' in norm
+
+
+def _merge_multi_header_rows(primary_row, secondary_row):
+	"""병합된 2단 헤더를 하나의 헤더로 정규화한다.
+
+	- 1행(상위 그룹명)과 2행(실제 항목명)이 같이 있을 때,
+	  실제 항목명이 있는 칸은 2행을 우선 사용한다.
+	- 연간입고량/연간사용·판매량처럼 1행에만 있는 값은 1행을 유지한다.
+	"""
+	group_titles = {
+		'화학물질관리법',
+		'산업안전보건법(유해인자)',
+		'위험물안전관리법',
+		'고압가스안전관리법',
+	}
+
+	def _norm(v):
+		return str(v or '').strip().replace(' ', '').replace('\n', '')
+
+	max_len = max(len(primary_row), len(secondary_row))
+	merged = []
+	for idx in range(max_len):
+		p = str(primary_row[idx]).strip() if idx < len(primary_row) else ''
+		s = str(secondary_row[idx]).strip() if idx < len(secondary_row) else ''
+
+		s_norm = _norm(s)
+		p_norm = _norm(p)
+
+		if s and s_norm not in group_titles:
+			merged.append(s)
+		elif p:
+			merged.append(p)
+		else:
+			merged.append(f'컬럼{idx + 1}')
+
+	return merged
+
+
+def _is_placeholder_header_text(value):
+	v = str(value or '').strip()
+	if v == '':
+		return True
+	return v.startswith('컬럼') or v.startswith('원본데이터')
 
 
 def _convert_quantity_code(value):
@@ -429,6 +744,109 @@ def _convert_quantity_code(value):
 	return QUANTITY_CODE_MAPPING.get(code, value)
 
 
+def _checkbox_state(value):
+	"""체크박스 텍스트를 checked/unchecked/None으로 판정한다."""
+	if value is None:
+		return None
+	raw = str(value).strip()
+	if raw == '' or raw.lower() in {'nan', 'none', 'null'}:
+		return None
+
+	norm = raw.lower()
+	checked_tokens = {'checked', 'true', 'on', 'yes', 'y', 'check', '체크', '☑', '☒', '✓', '✔', '▣', '■'}
+	unchecked_tokens = {'false', 'off', 'no', 'n', '미체크', 'unchecked', '☐', '□', '▢', '✗', 'x'}
+
+	if norm in checked_tokens or raw in checked_tokens:
+		return 'checked'
+	if norm in unchecked_tokens or raw in unchecked_tokens:
+		return 'unchecked'
+	if norm.startswith('checked'):
+		return 'checked'
+	if norm.startswith('unchecked'):
+		return 'unchecked'
+	return None
+
+
+
+def _normalize_checkbox_columns(header, data_rows, exclude_indices=None):
+	"""체크박스형 열을 판별해 ▣/▢ 문자열로 강제 통일하되, '심의중' 등 일반 텍스트는 보존한다."""
+	if not data_rows:
+		return data_rows
+
+	exclude = set(exclude_indices or [])
+	col_count = len(header)
+	
+	# ICIS 표에서 체크박스를 사용하는 주요 헤더 키워드
+	checkbox_headers = [
+		'유독물질', '제한물질', '금지물질', '사고대비물질', '위험물', '독성가스',
+		'허가물질', '중점관리물질', '금지·허가물질', '금지.허가물질', '노출·허용기준물질', 
+		'노출.허용기준물질', '직업환경측정물질', '인체등유해성물질'
+	]
+
+	for col_idx in range(col_count):
+		if col_idx in exclude:
+			continue
+
+		col_name = str(header[col_idx]).replace(' ', '')
+		is_checkbox_col = any(kw in col_name for kw in checkbox_headers)
+
+		# 헤더 이름으로 체크박스 열인지 확신할 수 없으면 데이터 비율로 추측합니다.
+		if not is_checkbox_col:
+			non_empty_values = []
+			states = []
+			for row in data_rows:
+				if col_idx >= len(row): continue
+				val = row[col_idx]
+				if val is None or str(val).strip() == '' or str(val).strip().lower() in {'nan', 'none', 'null'}:
+					continue
+				non_empty_values.append(val)
+				state = _checkbox_state(val)
+				if state is not None:
+					states.append(state)
+
+			if non_empty_values:
+				recognized_ratio = len(states) / len(non_empty_values)
+				checked_count = sum(1 for s in states if s == 'checked')
+				if recognized_ratio >= 0.8 and checked_count > 0:
+					is_checkbox_col = True
+
+		# 💡 핵심 수정: 체크박스 열이더라도 '심의중'과 같은 실제 텍스트는 파괴하지 않고 보존합니다.
+		if is_checkbox_col:
+			for row in data_rows:
+				if col_idx >= len(row): continue
+				val = str(row[col_idx]).strip()
+				
+				# 1. 빈 값은 빈 체크박스로 강제
+				if val == '' or val.lower() in {'nan', 'none', 'null'}:
+					row[col_idx] = '▢'
+					continue
+				
+				# 2. 체크 상태 판별
+				is_checked = False
+				is_checkbox_symbol = False
+				
+				if any(c in val for c in ['▣', '☑', '■', '체크됨']):
+					is_checked = True
+					is_checkbox_symbol = True
+				elif any(c in val for c in ['☐', '□', '▢', '✗', '미체크']) or val.lower() == 'x':
+					is_checkbox_symbol = True
+				
+				state = _checkbox_state(val)
+				if state == 'checked':
+					is_checked = True
+					is_checkbox_symbol = True
+				elif state == 'unchecked':
+					is_checkbox_symbol = True
+					
+				# 3. 식별된 기호라면 통일하고, 그 외의 명시적 텍스트('심의중' 등)라면 원본 보존
+				if is_checkbox_symbol:
+					row[col_idx] = '▣' if is_checked else '▢'
+				else:
+					row[col_idx] = val
+
+	return data_rows
+
+
 def clean_rows(rows):
 	"""헤더 위치를 기준으로 데이터 구간만 정리한다."""
 	if not rows:
@@ -436,27 +854,28 @@ def clean_rows(rows):
 
 	header_idx = None
 	for i, row in enumerate(rows):
-		joined = ' '.join(row)
-		if 'CAS' in joined or 'CAS No' in joined or 'CAS No.' in joined:
+		if _row_has_cas_header_token(row) or _is_header_only_row(row):
 			header_idx = i
 			break
 
 	if header_idx is not None:
 		rows = rows[header_idx:]
 		if len(rows) >= 2 and _is_header_only_row(rows[1]):
-			return [rows[0]] + rows[2:]
+			merged_header = _merge_multi_header_rows(rows[0], rows[1])
+			return [merged_header] + rows[2:]
 		return rows
 
 	return rows
 
 
 def workbook_to_bytes(rows):
-	"""ICIS 결과를 기존 형식(77열) 엑셀 바이트로 만든다."""
+	"""ICIS 결과를 기존 형식 기반으로 만들되, ICIS 원본 열(BK 이후)은 동적으로 반영하며, 
+	KOSHA 고정 헤더와 이름이 겹치는 경우 충돌을 방지한다."""
 	wb = Workbook()
 	ws = wb.active
 
-	# 기존 규칙을 그대로 유지하기 위해 헤더를 고정 목록으로 둔다.
-	full_headers = [
+	# A~BJ는 고정, BK 이후(ICIS 원본)는 연도별 원본 헤더를 그대로 반영한다.
+	fixed_headers = [
 		'#', '물질명칭', 'CAS No.', '결과없음', '발암성', '생식독성', '생식세포 변이원성', 'CMR',
 		'급성 독성(경구)', '급성 독성(경피)', '급성 독성(흡입)', '급성 독성', '흡인 유해성',
 		'피부 부식성/피부 자극성', '심한 눈 손상성/눈 자극성', '피부/눈 자극성', '호흡기 과민성',
@@ -469,11 +888,25 @@ def workbook_to_bytes(rows):
 		'관리대상유해물질', '특별관리물질', '작업환경측정대상물질', '특수건강진단대상물질',
 		'노출기준설정물질', '허용기준설정물질', '금지물질', '제한물질', '인체급성유해성물질',
 		'인체만성유해성물질', '생태유해성물질', '허가물질', '사고대비물질', '중점관리물질',
-		'위험물', '독성가스', '인체등유해성물질', '제한물질2', '금지물질2', '허가물질2',
-		'사고대비물질2', '중점관리물질2', '금지·허가물질2', '노출·허용기준물질2',
-		'직업환경측정물질등2', '위험물2', '독성가스2', '연간입고량', '연간사용·판매량',
-		'[11번] 특정표적장기 독성(1회 노출)', '[11번] 특정표적장기 독성(반복 노출)',
+		'위험물', '독성가스',
 	]
+
+	dynamic_headers = list(ICIS_DYNAMIC_HEADER_FALLBACK)
+	if rows and len(rows[0]) >= 2:
+		dynamic_headers = [str(h).strip() if str(h).strip() else f'컬럼{idx + 1}' for idx, h in enumerate(rows[0])]
+
+	# KOSHA 고정 헤더와 이름이 겹치면 뒤에 '2'를 붙여 데이터 충돌 차단[cite: 2]
+	fixed_set = set(fixed_headers)
+	for i in range(len(dynamic_headers)):
+		if dynamic_headers[i] in fixed_set:
+			dynamic_headers[i] = dynamic_headers[i] + '2'
+
+	if len(dynamic_headers) < 2:
+		dynamic_headers = list(ICIS_DYNAMIC_HEADER_FALLBACK)
+
+	# B/C와 중복되는 첫 2개(물질명칭, CAS No.)는 고정 영역을 사용하므로 제외[cite: 2]
+	full_headers = fixed_headers + dynamic_headers[2:]
+	total_cols = len(full_headers)
 
 	header_font = Font(name='맑은 고딕', size=10, bold=False)
 	header_font_bold = Font(name='맑은 고딕', size=10, bold=True)
@@ -516,24 +949,42 @@ def workbook_to_bytes(rows):
 			cell.comment = Comment(header_comments[c_idx], 'author')
 
 	ws.row_dimensions[1].height = 52.2
+    
+	# 주요 열 너비 일괄 지정
+	col_widths = {
+		'A': 5.5,   # No
+		'B': 25,  # 물질명칭
+		'C': 10,  # CAS No.
+		'D': 12,  # 결과없음
+  		'T': 10,
+		'U': 10,
+		'BV': 11,
+		'BW': 11,
+		'BX': 11,
+		'BY': 11
+	}
+	for col, width in col_widths.items():
+		ws.column_dimensions[col].width = width
 
 	# 데이터 행 작성
 	if rows and len(rows) > 1:
 		for r_idx, row in enumerate(rows[1:], start=2):
-			for c_idx in range(1, 78):
+			for c_idx in range(1, total_cols + 1):
 				cell = ws.cell(row=r_idx, column=c_idx)
 				cell.font = data_font
 				cell.border = thin_border
 
-				# 열 그룹별 배경색
+				# 열 그룹별 배경색 (헤더 이름을 확인하여 동적으로 색상 부여)
+				header_text = full_headers[c_idx - 1]
 				if 1 <= c_idx <= 3:
 					cell.fill = fill_abc
+				elif header_text.startswith('[11번]'):
+					cell.fill = fill_bx_by  # 위치에 상관없이 무조건 노란색
 				elif 4 <= c_idx <= 62:
 					cell.fill = fill_d_bj
-				elif 63 <= c_idx <= 75:
-					cell.fill = fill_bk_bw
 				else:
-					cell.fill = fill_bx_by
+					cell.fill = fill_bk_bw  # 나머지 유동적인 ICIS 데이터 열은 주황색
+
 
 				# 열별 값 배치
 				if c_idx == 1:
@@ -546,30 +997,12 @@ def workbook_to_bytes(rows):
 					cell.value = str(row[1]) if row[1] is not None else None
 					cell.alignment = alignment_default_center
 					cell.number_format = '@'
-				elif 63 <= c_idx <= 77 and len(row) > (c_idx - 61):
+				elif c_idx >= 63 and len(row) > (c_idx - 61):
 					cell.value = row[c_idx - 61]
 					cell.alignment = alignment_default_center
 				else:
 					cell.value = None
 					cell.alignment = alignment_default_center
-
-	# 열 너비 고정
-	column_widths = {
-		'A': 5.0, 'B': 31.0, 'C': 13.0, 'D': 12.0, 'E': 10.0, 'F': 10.0, 'G': 7.09765625,
-		'H': 9.0, 'I': 8.296875, 'J': 8.8984375, 'K': 8.3984375, 'L': 8.296875, 'M': 8.59765625,
-		'N': 10.19921875, 'O': 10.8984375, 'P': 11.0, 'Q': 8.59765625, 'R': 10.0, 'S': 10.0,
-		'T': 12.0, 'U': 12.0, 'V': 12.0, 'W': 9.5, 'X': 9.5, 'Y': 9.0, 'Z': 7.0,
-		'AA': 9.0, 'AB': 9.0, 'AC': 7.0, 'AD': 7.0, 'AE': 7.0, 'AF': 7.0, 'AG': 8.0,
-		'AH': 7.0, 'AI': 7.0, 'AJ': 8.0, 'AK': 9.0, 'AL': 9.0, 'AM': 9.0, 'AN': 9.0,
-		'AO': 9.0, 'AP': 9.0, 'AQ': 9.0, 'AR': 9.0, 'AS': 9.5, 'AT': 9.0, 'AU': 9.0,
-		'AV': 9.0, 'AW': 9.0, 'AX': 9.0, 'AY': 9.0, 'AZ': 9.0, 'BA': 8.0, 'BB': 8.0,
-		'BC': 9.0, 'BD': 9.0, 'BE': 8.0, 'BF': 8.0, 'BG': 8.0, 'BH': 8.0, 'BI': 8.0,
-		'BJ': 8.0, 'BK': 9.0, 'BL': 9.0, 'BM': 9.0, 'BN': 9.0, 'BO': 8.0, 'BP': 8.0,
-		'BQ': 9.0, 'BR': 9.0, 'BS': 9.0, 'BT': 9.0, 'BU': 9.0, 'BV': 9.5, 'BW': 9.5,
-		'BX': 15.0, 'BY': 15.0,
-	}
-	for col_letter, width in column_widths.items():
-		ws.column_dimensions[col_letter].width = width
 
 	ws.sheet_view.zoomScale = 80
 
@@ -577,7 +1010,6 @@ def workbook_to_bytes(rows):
 	wb.save(buffer)
 	buffer.seek(0)
 	return buffer.getvalue()
-
 
 def create_excel_bytes_for_company(session, company_name, item, search_year=None):
 	"""ICIS 데이터로 업체별 기본 엑셀(아직 KOSHA 미반영)을 만든다."""
@@ -592,33 +1024,87 @@ def create_excel_bytes_for_company(session, company_name, item, search_year=None
 	if not target_table_html:
 		raise RuntimeError('화학물질 취급현황 섹션의 두번째 표를 찾을 수 없습니다.')
 
+	crawled_header = extract_table_headers_from_html(target_table_html)
 	rows = parse_table_html(target_table_html)
 	rows = clean_rows(rows)
 	if not rows:
 		raise RuntimeError('표에서 데이터를 찾을 수 없습니다.')
 
-	first_join = ' '.join(rows[0]) if rows else ''
-	data_rows = rows[1:] if ('CAS' in first_join or 'CAS No' in first_join or 'CAS No.' in first_join) else rows
+	header_row_idx = None
+	if rows:
+		if _row_has_cas_header_token(rows[0]) or _is_header_only_row(rows[0]):
+			header_row_idx = 0
+		elif len(rows) > 1 and (_row_has_cas_header_token(rows[1]) or _is_header_only_row(rows[1])):
+			header_row_idx = 1
 
-	# BK~BY로 들어갈 ICIS 원본 데이터 헤더
-	header = [
-		'물질명칭', 'CAS No.',
-		'인체등유해성물질', '제한물질2', '금지물질2', '허가물질2', '사고대비물질2', '중점관리물질2',
-		'금지·허가물질2', '노출·허용기준물질2', '직업환경측정물질등2', '위험물2', '독성가스2',
-		'연간입고량', '연간사용·판매량', '[11번] 특정표적장기 독성(1회 노출)', '[11번] 특정표적장기 독성(반복 노출)',
-	]
+	has_header = header_row_idx is not None
+	data_rows = rows[header_row_idx + 1:] if has_header else rows
+
+	if crawled_header and len(crawled_header) >= 2:
+		header = [str(h).strip() if str(h).strip() else f'컬럼{idx + 1}' for idx, h in enumerate(crawled_header)]
+		if has_header and len(rows) > (header_row_idx + 1) and _is_header_only_row(rows[header_row_idx + 1]):
+			data_rows = rows[header_row_idx + 2:]
+	elif has_header:
+		header = [str(h).strip() if str(h).strip() else f'컬럼{idx + 1}' for idx, h in enumerate(rows[header_row_idx])]
+		if len(rows) > (header_row_idx + 1):
+			placeholder_count = sum(1 for h in header if _is_placeholder_header_text(h))
+			if placeholder_count >= max(3, len(header) // 3) and _is_header_only_row(rows[header_row_idx + 1]):
+				header = _merge_multi_header_rows(header, rows[header_row_idx + 1])
+				data_rows = rows[header_row_idx + 2:]
+	else:
+		header = list(ICIS_DYNAMIC_HEADER_FALLBACK)
+
+	# 헤더 텍스트만 반복되는 행(2단 헤더 하단행 등)이 데이터로 섞이지 않도록 제거한다.
+	filtered_data_rows = []
+	for row in data_rows:
+		if _is_header_only_row(row):
+			continue
+		filtered_data_rows.append(row)
+	data_rows = filtered_data_rows
+
+	if len(header) < 2:
+		header = ['물질명칭', 'CAS No.']
+
+	# 고정 영역(B/C)과 맞추기 위해 앞 2개는 표준 명칭으로 강제한다.
+	header[0] = '물질명칭'
+	header[1] = 'CAS No.'
+
+	# [11번] 2개 열은 연도별 ICIS 변동과 무관하게 항상 유지한다.
+	for stot_col in ['[11번] 특정표적장기 독성(1회 노출)', '[11번] 특정표적장기 독성(반복 노출)']:
+		if stot_col not in header:
+			header.append(stot_col)
 
 	# 연간입고량/연간사용·판매량 코드 변환
-	quantity_columns = {13, 14}
+	def _norm_header(v):
+		return str(v).replace(' ', '').replace('.', '').replace('·', '').strip()
+
+	quantity_columns = {
+		idx for idx, col_name in enumerate(header)
+		if _norm_header(col_name) in {'연간입고량', '연간사용판매량'}
+	}
+
 	converted_rows = []
 	for row in data_rows:
+		row_values = list(row)
+		if len(row_values) < len(header):
+			row_values.extend([''] * (len(header) - len(row_values)))
+		elif len(row_values) > len(header):
+			row_values = row_values[:len(header)]
+
 		converted_row = []
-		for idx, cell in enumerate(row):
+		for idx, cell in enumerate(row_values):
 			if idx in quantity_columns:
 				converted_row.append(_convert_quantity_code(cell))
 			else:
 				converted_row.append(cell)
 		converted_rows.append(converted_row)
+
+	# 2014 등 체크박스 기반 표현은 ▣/▢로 통일한다.
+	converted_rows = _normalize_checkbox_columns(
+		header,
+		converted_rows,
+		exclude_indices={0, 1, *quantity_columns},
+	)
 
 	final_rows = [header] + converted_rows
 	return company_name_full, workbook_to_bytes(final_rows)
@@ -654,6 +1140,7 @@ def search_companies(keywords, search_year=None):
 			'bplcId': item.get('bplcId', ''),
 			'company_name': company_name,
 			'region': region,
+   			'address': company_address,  # 👈 주소 데이터 추가
 			'use_region_in_filename': duplicate_counts[company_name_key] > 1,
 			'search_keyword': keyword,
 		})
@@ -663,6 +1150,7 @@ def search_companies(keywords, search_year=None):
 			'index': len(search_results),
 			'company_name': f'검색 결과 없음: {keyword}',
 			'region': '',
+			'address': '',  # 👈 주소 빈값 처리 추가
 			'use_region_in_filename': False,
 			'search_keyword': keyword,
 		})
@@ -1478,9 +1966,18 @@ def _write_excel_results(wb, ws, hazard_df):
 	"""KOSHA 조회 결과를 기존 워크북에 써 넣고 표2~표4를 만든다."""
 	col_name_to_idx = {cell.value: idx for idx, cell in enumerate(ws[1], start=1)}
 
+	#closed 260718
+	#for row in ws['A1:BY1']:
+	#	for cell in row:
+	#		cell.fill = fill_header
+	#		cell.font = default_font
+	#		if cell.value in ['발암성', '생식독성', 'CMR', '급성 독성', '피부/눈 자극성', '특정표적장기 독성', '수생환경 유해성', '인화성', '연간사용·판매량']:
+	#			cell.font = bold_font
+
+	#260718
 	# 헤더 스타일 보정(기존 makeResult 동작 유지)
-	for row in ws['A1:BY1']:
-		for cell in row:
+	for cell in ws[1]:  # 첫 번째 행(제목행)의 모든 셀을 순회
+		if cell.value is not None and str(cell.value).strip() != '':
 			cell.fill = fill_header
 			cell.font = default_font
 			if cell.value in ['발암성', '생식독성', 'CMR', '급성 독성', '피부/눈 자극성', '특정표적장기 독성', '수생환경 유해성', '인화성', '연간사용·판매량']:
@@ -1495,13 +1992,16 @@ def _write_excel_results(wb, ws, hazard_df):
 				cell = ws.cell(row=excel_row, column=col_idx)
 				cell.value = row.get(col_name, '')
 
-				col_letter = get_column_letter(col_idx)
-				if col_letter in ['A', 'B', 'C']:
+				# 열 이름을 기반으로 배경색을 정확히 덮어쓰기
+				if col_idx in [1, 2, 3]:
 					cell.fill = fill_label
-				elif col_letter in ['BK', 'BL', 'BM', 'BN', 'BO', 'BP', 'BQ', 'BR', 'BS', 'BT', 'BU', 'BV', 'BW']:
-					cell.fill = fill_data2
+				elif col_name.startswith('[11번]'):
+					cell.fill = fill_data1  # [11번] 열은 무조건 노란색
+				elif col_idx >= 63:
+					cell.fill = fill_data2  # ICIS 원본 영역(주황색)
 				else:
-					cell.fill = fill_data1
+					cell.fill = fill_data1  # KOSHA 열은 노란색
+
 
 				if col_name in [
 					'#', 'CAS No.', '결과없음', '개정일',
@@ -1629,15 +2129,32 @@ def _build_summary_tables(ws, hazard_df):
 			cell.border = thin_border
 
 	# -------- 표3 --------
-	summary_titles = [
-		'관리대상유해물질', '특별관리물질', '작업환경측정대상물질', '특수건강진단대상물질',
-		'노출기준설정물질', '허용기준설정물질', '금지물질', '제한물질',
-		'인체급성유해성물질', '인체만성유해성물질', '생태유해성물질',
-		'허가물질', '사고대비물질', '중점관리물질', '위험물', '독성가스',
-		'인체등유해성물질',
-		'제한물질2', '금지물질2', '허가물질2', '사고대비물질2',
-		'중점관리물질2', '금지·허가물질2', '노출·허용기준물질2', '직업환경측정물질등2', '위험물2', '독성가스2',
-	]
+	# 1. 엑셀의 1행(헤더)을 모두 순회하여 시작점(관리대상유해물질)과 종료점(연간입고량) 위치 파악
+	col_idx_start = None
+	col_idx_end = None
+	
+	for col in range(1, ws.max_column + 1):
+		header_val = ws.cell(row=1, column=col).value
+		if header_val is not None and str(header_val).strip() != '':
+			# 공백, 줄바꿈, 특수기호(·, .)를 모두 제거하여 판별
+			norm_name = str(header_val).strip().replace(' ', '').replace('·', '').replace('.', '').replace('\n', '')
+			
+			# 시작점
+			if norm_name == '관리대상유해물질':
+				col_idx_start = col
+			
+			# 종료점 (연간입고량 또는 연간사용량 등)
+			if col_idx_end is None and ('연간입고' in norm_name or '연간사용' in norm_name or '연간판매' in norm_name):
+				col_idx_end = col
+
+	# 2. 시작점과 종료점 사이의 모든 헤더를 순서대로 수집 (표1과 100% 동일하게 연동)
+	valid_summary_items = []
+	if col_idx_start and col_idx_end:
+		for col in range(col_idx_start, col_idx_end):
+			header_name = ws.cell(row=1, column=col).value
+			if header_name:
+				valid_summary_items.append((header_name, col))
+
 	summary_start_col = 47
 	table3_start_row = end_row + 2
 
@@ -1669,28 +2186,30 @@ def _build_summary_tables(ws, hazard_df):
 	c.border = thin_border
 	c.fill = fill_label
 
-	for idx, col_name in enumerate(summary_titles):
+	# 3. 수집된 항목들로 표3 제목 및 데이터 출력
+	for idx, (col_name, col_idx) in enumerate(valid_summary_items):
+		# 헤더(제목)
 		cell = ws.cell(row=table3_start_row, column=summary_start_col + idx, value=col_name)
 		cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 		cell.font = default_font
 		cell.border = thin_border
 		cell.fill = fill_header
 
-	for idx in range(len(summary_titles)):
-		col_idx = summary_start_col + idx
+		# 물질 수 계산
 		count = sum(1 for r in range(start_row, end_row + 1) if str(ws.cell(row=r, column=col_idx).value).strip() == '▣')
+		cell_count = ws.cell(row=table3_start_row + 1, column=summary_start_col + idx, value=count)
+		cell_count.alignment = Alignment(horizontal='center', vertical='center')
+		cell_count.font = default_font
+		cell_count.border = thin_border
 
-		cell = ws.cell(row=table3_start_row + 1, column=col_idx, value=count)
-		cell.alignment = Alignment(horizontal='center', vertical='center')
-		cell.font = default_font
-		cell.border = thin_border
-
+		# 비율 계산
 		ratio = f'{round((count / analyzed_count2) * 100)}%' if analyzed_count2 else '0%'
-		cell = ws.cell(row=table3_start_row + 2, column=col_idx, value=ratio)
-		cell.alignment = Alignment(horizontal='center', vertical='center')
-		cell.font = default_font
-		cell.border = thin_border
-
+		cell_ratio = ws.cell(row=table3_start_row + 2, column=summary_start_col + idx, value=ratio)
+		cell_ratio.alignment = Alignment(horizontal='center', vertical='center')
+		cell_ratio.font = default_font
+		cell_ratio.border = thin_border
+  
+  
 	# -------- 표4 --------
 	def _normalize_header(value):
 		if value is None:
@@ -1708,11 +2227,27 @@ def _build_summary_tables(ws, hazard_df):
 			col_idx_use = col
 
 	if col_idx_in is None or col_idx_use is None:
+		# 연도별 헤더 문구 차이를 고려해 키워드 포함으로 재탐색한다.
+		for col in range(1, ws.max_column + 1):
+			header = ws.cell(row=1, column=col).value
+			norm = _normalize_header(header).replace('.', '').replace('·', '')
+			if col_idx_in is None and '연간입고' in norm:
+				col_idx_in = col
+			if col_idx_use is None and ('연간사용' in norm or '연간판매' in norm):
+				col_idx_use = col
+
+	if col_idx_in is None or col_idx_use is None:
 		return
 
 	table3_end_row = table3_start_row + 2
 	table4_start_row = table3_end_row + 2
-	table4_start_col = 73
+	
+	# 💡 핵심: 표3의 개수가 달라져도, 표4가 무조건 표3의 마지막 열(기존 '독성가스2' 위치)에서 시작되도록 자동 계산
+	if valid_summary_items:
+		table4_start_col = summary_start_col + len(valid_summary_items) - 1
+	else:
+		table4_start_col = 73
+
 	headers4 = ['중량(톤/년) 또는 부피단위(㎥/년)', '연간입고량', '연간사용·판매량']
 
 	for idx, header in enumerate(headers4):
@@ -1822,6 +2357,59 @@ def _build_summary_tables(ws, hazard_df):
 		c_use.font = default_font
 		c_use.alignment = Alignment(horizontal='center', vertical='center')
 		c_use.border = thin_border
+  
+	# -------- 표5 (영업비밀 요약) --------
+	# 위치: 표2 시작점(summary_start_row) 기준으로 +12행 (데이터 10행 + 1칸 띄우기)
+	table5_start_row = summary_start_row + 12
+	table5_start_col = 4  # D열
+
+	secret_count = 0
+	review_count = 0
+	total_count = end_row - start_row + 1
+	col_result_idx = HAZARD_ORDER.index('결과없음') + 1 # D열
+
+	# 표1의 D열(결과없음) 순회하며 데이터 카운팅
+	for r in range(start_row, end_row + 1):
+		val = str(ws.cell(row=r, column=col_result_idx).value or '').strip()
+		if val == '영업비밀':
+			secret_count += 1
+		elif val in ('심의중', '심사중'):
+			review_count += 1
+
+	# 영업비밀율(%) 계산
+	secret_ratio = f"{round((secret_count / total_count) * 100)}%" if total_count > 0 else "0%"
+
+	# 표5 헤더 생성
+	table5_headers = ['영업비밀', '#']
+	for idx, h_text in enumerate(table5_headers):
+		cell = ws.cell(row=table5_start_row, column=table5_start_col + idx, value=h_text)
+		cell.alignment = Alignment(horizontal='center', vertical='center')
+		cell.font = default_font
+		cell.border = thin_border
+		cell.fill = fill_header
+
+	# 표5 데이터 입력
+	table5_data = [
+		('영업비밀', secret_count),
+		('심사중', review_count),
+		('전체물질', total_count),
+		('영업비밀율(%)', secret_ratio)
+	]
+
+	for row_offset, (label, val) in enumerate(table5_data, start=1):
+		r_idx = table5_start_row + row_offset
+
+		# D열 라벨 셀
+		lbl_cell = ws.cell(row=r_idx, column=table5_start_col, value=label)
+		lbl_cell.alignment = Alignment(horizontal='center', vertical='center')
+		lbl_cell.font = default_font
+		lbl_cell.border = thin_border
+
+		# E열 값 셀
+		val_cell = ws.cell(row=r_idx, column=table5_start_col + 1, value=val)
+		val_cell.alignment = Alignment(horizontal='center', vertical='center')
+		val_cell.font = default_font
+		val_cell.border = thin_border
 
 
 def _extract_data_rows_from_workbook(ws):
@@ -1871,7 +2459,7 @@ def fill_kosha_into_workbook_bytes(base_excel_bytes, service_key, progress_callb
 	return out.getvalue()
 
 
-def create_final_excel_bytes_for_company(session, keyword, company_item, progress_callback=None):
+def create_final_excel_bytes_for_company(session, keyword, company_item, search_year=None, progress_callback=None):
 	"""
 	통합 핵심 함수
 	1) ICIS 템플릿 생성
@@ -1882,7 +2470,7 @@ def create_final_excel_bytes_for_company(session, keyword, company_item, progres
 		session=session,
 		company_name=keyword,
 		item=company_item,
-		search_year=None,
+		search_year=search_year,
 	)
 	final_excel_bytes = fill_kosha_into_workbook_bytes(
 		base_excel_bytes,
@@ -1914,6 +2502,8 @@ def check_individual_toggle():
 
 def _init_session_state():
 	"""화면에서 쓰는 상태값을 한 번에 초기화한다."""
+	year_labels = [item['label'] for item in get_search_year_options()]
+	default_year_label = get_default_search_year_label()
 	defaults = {
 		'search_results': [],
 		'files': {},
@@ -1934,10 +2524,16 @@ def _init_session_state():
 		'download_filename': '',
 		'download_mime_type': 'application/zip',
 		'download_completed': False,
+		'search_year_input': get_default_search_year_label(),
+		'search_year': str(DEFAULT_SEARCH_YEAR),
 	}
 	for key, value in defaults.items():
 		if key not in st.session_state:
 			st.session_state[key] = value
+
+	current_year_input = st.session_state.get('search_year_input')
+	if current_year_input not in year_labels:
+		st.session_state['search_year_input'] = default_year_label
 
 
 def _render_status_cell(idx, text_placeholder, bar_placeholder):
@@ -1971,6 +2567,8 @@ def _clear_search_runtime_state(clear_keyword=False):
 
 	if clear_keyword:
 		st.session_state['keyword_input'] = ''
+		st.session_state['search_year_input'] = get_default_search_year_label()
+		st.session_state['search_year'] = str(DEFAULT_SEARCH_YEAR)
 
 	st.session_state['search_results'] = []
 	st.session_state['current_page'] = 1
@@ -2001,7 +2599,7 @@ def main_ui(tab_mode=False):
 	with col_ver:
 		st.markdown(
 			"""<div style="text-align: right; color: #999; font-size: 15px; margin-top: 10px;">
-			v2.260705
+			v2.260724
 			</div>""",
 			unsafe_allow_html=True,
 		)
@@ -2021,13 +2619,151 @@ def main_ui(tab_mode=False):
 		border-color: #b1bac4 !important;
 	}
 
+	/* 검색 버튼 (Primary) 스타일 커스텀 */
+	div[data-testid="stForm"] button[kind="primary"] {
+		background-color: #d05a18 !important;
+		color: #ffffff !important;
+		border: none !important;
+		font-weight: 600 !important;
+	}
+	div[data-testid="stForm"] button[kind="primary"]:hover {
+		background-color: #b34a10 !important;
+	}
+
+	/* 초기화 버튼 (Secondary) 스타일 커스텀 */
+	div[data-testid="stForm"] button[kind="secondary"] {
+		background-color: #4b4b4b !important;
+		color: #ffffff !important;
+		border: none !important;
+		font-weight: 600 !important;
+	}
+	div[data-testid="stForm"] button[kind="secondary"]:hover {
+		background-color: #333333 !important;
+	}
+
 	/* st.form 스타일 자체를 테두리 둥근 카드로 리디자인 */
 	div[data-testid="stForm"] {
-		border: 1px solid #e6e8eb !important;
+		border: 1px solid #d9dde3 !important;
 		border-radius: 12px !important;
-		padding: 20px !important;
+		padding: 18px 20px 16px 20px !important;
+		background-color: #f7f9fc !important;
+		box-shadow: 0 2px 4px rgba(0,0,0,0.03) !important;
+	}
+
+	/* 검색 카드 내부 배치 */
+	.search-card-top-row {
+		display: flex !important;
+		align-items: center !important;
+		gap: 18px !important;
+		flex-wrap: nowrap !important;
+	}
+	.search-card-item {
+		display: flex !important;
+		align-items: center !important;
+		gap: 12px !important;
+		min-width: 0 !important;
+		height: 38px !important;
+		margin-top: -7px !important;
+	}
+	.search-card-label {
+		display: flex !important;
+		align-items: center !important;
+		gap: 6px !important;
+		font-size: 15px !important;
+		font-weight: 700 !important;
+		color: #111 !important;
+		white-space: nowrap !important;
+		flex: 0 0 auto !important;
+		height: 38px !important;
+		line-height: 38px !important;
+  		margin-top: -7px !important;
+	}
+	.search-card-bullet {
+		color: #1d4ed8 !important;
+		font-size: 15px !important;
+		line-height: 1 !important;
+	}
+	.search-card-control {
+		min-width: 0 !important;
+		flex: 1 1 auto !important;
+	}
+	.search-year-control {
+		flex: 0 0 132px !important;
+		max-width: 132px !important;
+	}
+	.search-company-control {
+		flex: 1 1 auto !important;
+		min-width: 0 !important;
+	}
+	.search-divider {
+		border-top: 1px solid #d9e2ef !important;
+		margin: 4px 0 18px 0 !important;
+	}
+	.search-button-row {
+		display: flex !important;
+		justify-content: center !important;
+		gap: 16px !important;
+		align-items: center !important;
+	}
+	.search-button-row > div {
+		flex: 0 0 116px !important;
+		max-width: 116px !important;
+	}
+
+	@media (max-width: 480px) {
+		/* 검색 폼 내부는 좁은 화면에서 세로 스택으로 바꿔 겹침을 방지한다. */
+		.search-card-top-row,
+		.search-button-row {
+			flex-direction: column !important;
+			gap: 10px !important;
+		}
+		.search-card-item,
+		.search-card-control,
+		.search-button-row > div {
+			width: 100% !important;
+			min-width: 100% !important;
+			flex: 1 1 100% !important;
+		}
+		.search-card-item > div,
+		.search-card-control > div {
+			width: 100% !important;
+		}
+		p.search-label-txt {
+			transform: none !important;
+			white-space: normal !important;
+			margin-bottom: 4px !important;
+		}
+		div[data-testid="stForm"] div[data-testid="stTextInput"] input,
+		div[data-testid="stForm"] div[data-testid="stSelectbox"] div,
+		div[data-testid="stForm"] div[data-testid="stSelectbox"] button {
+			width: 100% !important;
+		}
+		div[data-testid="stForm"] div[data-testid="stButton"] button {
+			width: 100% !important;
+		}
+	}
+
+	div[data-testid="stForm"] div[data-testid="stButton"] button {
+		min-height: 38px !important;
+		height: 38px !important;
+		padding-top: 0 !important;
+		padding-bottom: 0 !important;
+	}
+	div[data-testid="stForm"] div[data-testid="stSelectbox"] [data-baseweb="select"] > div {
+		min-height: 38px !important;
+		height: 38px !important;
 		background-color: #ffffff !important;
-		box-shadow: 0 4px 6px rgba(0,0,0,0.02) !important;
+		border: 1px solid #d0d7de !important;
+	}
+	.search-year-control div[data-baseweb="select"] > div {
+		max-width: 132px !important;
+	}
+	.search-year-control [data-baseweb="select"] {
+		max-width: 132px !important;
+	}
+	div[data-testid="stForm"] div[data-testid="stTextInput"] input {
+		height: 38px !important;
+		min-height: 38px !important;
 	}
 
 	/* 입력창 실제 입력 필드의 배경을 흰색으로 지정하고 플레이스홀더 글자크기(14px)와 완벽 통일 */
@@ -2106,17 +2842,18 @@ def main_ui(tab_mode=False):
 		min-height: unset !important;
 	}
 
-	/* No, 지역, 상태 열(1, 2, 4, 5번째 열) 내용 가운데 가로 정렬 */
+	/* No, 지역, 상태 열(1, 2, 4, 6번째 열) 내용 가운데 가로 정렬 */
 	div.table-row-container div[data-testid="column"]:nth-of-type(1),
 	div.table-row-container div[data-testid="column"]:nth-of-type(2),
 	div.table-row-container div[data-testid="column"]:nth-of-type(4),
-	div.table-row-container div[data-testid="column"]:nth-of-type(5) {
+	div.table-row-container div[data-testid="column"]:nth-of-type(6) {
 		justify-content: center !important;
 	}
 
-	/* 업체명 및 파일명 열(3, 6번째 열) 내용 왼쪽 정렬 유지 */
+	/* 업체명, 주소, 파일명 열(3, 5, 7번째 열) 내용 왼쪽 정렬 유지 */
 	div.table-row-container div[data-testid="column"]:nth-of-type(3),
-	div.table-row-container div[data-testid="column"]:nth-of-type(6) {
+	div.table-row-container div[data-testid="column"]:nth-of-type(5),
+	div.table-row-container div[data-testid="column"]:nth-of-type(7) {
 		justify-content: flex-start !important;
 	}
 
@@ -2359,30 +3096,63 @@ def main_ui(tab_mode=False):
 		_clear_search_runtime_state(clear_keyword=True)
 		st.session_state['reset_requested'] = False
 
-	# [상단 검색 카드] createForm과 동일 구조
+	# [상단 검색 카드] 간격 및 비율 조정
 	with st.form(key='search_form', clear_on_submit=False):
-		col1, col2, col3 = st.columns([0.72, 0.14, 0.14])
+		year_options = get_search_year_options()
+		default_year_label = get_default_search_year_label()
+		year_labels = [item['label'] for item in year_options]
+		current_year_label = st.session_state.get('search_year_input', default_year_label)
+		if current_year_label not in year_labels:
+			current_year_label = default_year_label
 
-		with col1:
-			sub_col_lbl, sub_col_input = st.columns([0.08, 0.92])
-			with sub_col_lbl:
-				st.markdown('<p class="search-label-txt">업체 검색</p>', unsafe_allow_html=True)
-			with sub_col_input:
-				keyword_input = st.text_input(
-					'업체 검색',
-					value='',
-					placeholder='예) 삼성전자, 엘지화학',
-					key='keyword_input',
-					label_visibility='collapsed',
-				)
-				search_msg_container = st.empty()
+		# 비율 조정을 통해 라벨과 입력 필드 간격을 좁히고 전체 필드를 균형있게 배치
+		#search_row_year_lbl, search_row_year_input, search_row_company_lbl, search_row_company_input = st.columns([0.06, 0.14, 0.09, 0.71], vertical_alignment='center')
+		search_row_year_lbl, search_row_year_input, spacer, search_row_company_lbl, search_row_company_input = st.columns([0.05, 0.14, 0.04, 0.06, 0.67], vertical_alignment='center')
+		with search_row_year_lbl:
+			st.markdown(
+				'<div class="search-card-item"><span class="search-card-label"><span class="search-card-bullet">•</span><span>연도</span></span></div>',
+				unsafe_allow_html=True,
+			)
+		with search_row_year_input:
+			search_year_input = st.selectbox(
+				'연도',
+				options=year_labels,
+				index=year_labels.index(current_year_label),
+				key='search_year_input',
+				label_visibility='collapsed',
+			)   
+		with spacer:
+			st.empty() # 이 부분이 빈 공간을 만들어 줍니다.    
+		with search_row_company_lbl:
+			st.markdown(
+				'<div class="search-card-item"><span class="search-card-label"><span class="search-card-bullet">•</span><span>업체명</span></span></div>',
+				unsafe_allow_html=True,
+			)
+		with search_row_company_input:
+			keyword_input = st.text_input(
+				'업체명',
+				value='',
+				placeholder='업체명을 입력하세요.',
+				key='keyword_input',
+				label_visibility='collapsed',
+			)
 
+		st.markdown('<div class="search-divider"></div>', unsafe_allow_html=True)
 		search_button_pressed = False
 		reset_button_pressed = False
-		with col2:
-			search_button_pressed = st.form_submit_button('🔍 검색', use_container_width=True)
-		with col3:
-			reset_button_pressed = st.form_submit_button('↺ 초기화', use_container_width=True)
+		
+		# 버튼들이 중앙으로 더 좁게 모이도록 가로 column 서식 재설정
+		search_button_spacer_left, search_button_col1, search_button_col2, search_button_spacer_right = st.columns([0.38, 0.12, 0.12, 0.38], vertical_alignment='center')
+		with search_button_spacer_left:
+			st.empty()
+		with search_button_col1:
+			search_button_pressed = st.form_submit_button('검색', use_container_width=True, type='primary')
+		with search_button_col2:
+			reset_button_pressed = st.form_submit_button('초기화', use_container_width=True, type='secondary')
+		with search_button_spacer_right:
+			st.empty()
+
+		search_msg_container = st.empty()
 
 	# 검색 초기화
 	if reset_button_pressed:
@@ -2401,8 +3171,10 @@ def main_ui(tab_mode=False):
 				search_msg_container.markdown('<p style="color: #e53e3e; font-size: 15px; font-weight: 500; margin-top: -10px; margin-bottom: 10px;">유효한 검색어가 없습니다.</p>', unsafe_allow_html=True)
 			else:
 				st.session_state['keywords'] = ', '.join(keywords)
+				search_year = normalize_search_year(search_year_input)
+				st.session_state['search_year'] = search_year
 				try:
-					search_results = search_companies(keywords)
+					search_results = search_companies(keywords, search_year=search_year)
 
 					actual_results = [item for item in search_results if not item['company_name'].startswith('검색 결과 없음')]
 					no_result_keywords = [item['search_keyword'] for item in search_results if item['company_name'].startswith('검색 결과 없음')]
@@ -2419,20 +3191,20 @@ def main_ui(tab_mode=False):
 
 					if actual_results:
 						st.session_state['search_success_message'] = f'{len(actual_results)}개의 업체를 찾았습니다.'
-						search_msg_container.markdown(f'<p style="color: #e53e3e; font-size: 15px; font-weight: 500; margin-top: -10px; margin-bottom: 10px;">{st.session_state["search_success_message"]}</p>', unsafe_allow_html=True)
+						search_msg_container.markdown(f'<p style="color: #e53e3e; font-size: 15px; font-weight: 500; text-align: center; margin-top: -10px; margin-bottom: 10px;">{st.session_state["search_success_message"]}</p>', unsafe_allow_html=True)
 					elif no_result_keywords:
 						st.session_state['search_success_message'] = '검색 결과가 없습니다'
-						search_msg_container.markdown(f'<p style="color: #e53e3e; font-size: 15px; font-weight: 500; margin-top: -10px; margin-bottom: 10px;">{st.session_state["search_success_message"]}</p>', unsafe_allow_html=True)
+						search_msg_container.markdown(f'<p style="color: #e53e3e; font-size: 15px; font-weight: 500; text-align: center; margin-top: -10px; margin-bottom: 10px;">{st.session_state["search_success_message"]}</p>', unsafe_allow_html=True)
 
 					st.session_state['last_search_keywords'] = ', '.join(keywords)
 				except Exception as exc:
-					search_msg_container.markdown(f'<p style="color: #e53e3e; font-size: 15px; font-weight: 500; margin-top: -10px; margin-bottom: 10px;">검색 중 오류: {exc}</p>', unsafe_allow_html=True)
+					search_msg_container.markdown(f'<p style="color: #e53e3e; font-size: 15px; font-weight: 500; text-align: center; margin-top: -10px; margin-bottom: 10px;">검색 중 오류: {exc}</p>', unsafe_allow_html=True)
 
 	search_results = st.session_state['search_results']
 
 	if search_results:
 		if st.session_state['search_success_message']:
-			search_msg_container.markdown(f'<p style="color: #e53e3e; font-size: 15px; font-weight: 500; margin-top: -10px; margin-bottom: 10px;">{st.session_state["search_success_message"]}</p>', unsafe_allow_html=True)
+			search_msg_container.markdown(f'<p style="color: #e53e3e; font-size: 15px; font-weight: 500; text-align: center; margin-top: -10px; margin-bottom: 10px;">{st.session_state["search_success_message"]}</p>', unsafe_allow_html=True)
 
 		@st.fragment
 		def render_interactive_table():
@@ -2463,7 +3235,8 @@ def main_ui(tab_mode=False):
 
 			st.markdown('<div class="table-row-container">', unsafe_allow_html=True)
 
-			header_cols = st.columns([0.05, 0.08, 0.32, 0.1, 0.18, 0.34])
+			column_ratios = [0.04, 0.05, 0.18, 0.08, 0.28, 0.12, 0.25]
+			header_cols = st.columns(column_ratios)
 			header_style = 'background-color: #f0f0f0; padding: 6px 12px; font-weight: bold; text-align: center; border-radius: 4px;'
 
 			with header_cols[0]:
@@ -2475,8 +3248,10 @@ def main_ui(tab_mode=False):
 			with header_cols[3]:
 				st.markdown(f'<div style="{header_style}">지역</div>', unsafe_allow_html=True)
 			with header_cols[4]:
-				st.markdown(f'<div style="{header_style}">상태</div>', unsafe_allow_html=True)
+				st.markdown(f'<div style="{header_style}">주소</div>', unsafe_allow_html=True) # 👈 주소 헤더 추가
 			with header_cols[5]:
+				st.markdown(f'<div style="{header_style}">상태</div>', unsafe_allow_html=True)
+			with header_cols[6]:
 				st.markdown(f'<div style="{header_style}">파일명</div>', unsafe_allow_html=True)
 
 			st.markdown('<div style="margin-bottom: 12px;"></div>', unsafe_allow_html=True)
@@ -2507,7 +3282,7 @@ def main_ui(tab_mode=False):
 				if f'filename_{i}' not in st.session_state:
 					st.session_state[f'filename_{i}'] = ''
 
-				cols = st.columns([0.05, 0.08, 0.32, 0.1, 0.18, 0.34])
+				cols = st.columns(column_ratios)
 
 				with cols[0]:
 					st.checkbox('', key=f'chk_{i}', label_visibility='collapsed', on_change=check_individual_toggle)
@@ -2518,10 +3293,12 @@ def main_ui(tab_mode=False):
 				with cols[3]:
 					st.markdown(f'<div style="text-align: center;">{result.get("region", "") or ""}</div>', unsafe_allow_html=True)
 				with cols[4]:
+					st.write(result.get('address', '')) # 👈 주소 텍스트 출력 추가
+				with cols[5]:
 					status_text_placeholders[i] = st.empty()
 					status_bar_placeholders[i] = st.empty()
 					_render_status_cell(i, status_text_placeholders[i], status_bar_placeholders[i])
-				with cols[5]:
+				with cols[6]:
 					filename_placeholders[i] = st.empty()
 					filename_placeholders[i].write(st.session_state[f'filename_{i}'])
 
@@ -2662,13 +3439,15 @@ def main_ui(tab_mode=False):
 									session=session,
 									keyword=keyword,
 									company_item={'bplcId': bplc_id, 'bplcNm': company_name},
+									search_year=st.session_state.get('search_year', DEFAULT_SEARCH_YEAR),
 									progress_callback=_company_progress,
 								)
 
+								search_year = normalize_search_year(st.session_state.get('search_year', DEFAULT_SEARCH_YEAR))
 								if use_region and region and region != '':
-									filename = f"{sanitize_filename(company_name_full)}_{sanitize_filename(region)}.xlsx"
+									filename = build_year_prefixed_filename(f'{company_name_full}_{region}', search_year, 'xlsx')
 								else:
-									filename = f"{sanitize_filename(company_name_full)}.xlsx"
+									filename = build_year_prefixed_filename(company_name_full, search_year, 'xlsx')
 
 								if 'files' not in st.session_state:
 									st.session_state['files'] = {}
@@ -2712,10 +3491,11 @@ def main_ui(tab_mode=False):
 							zip_bytes = zip_files(st.session_state['files'], selected_filenames)
 							now = datetime.now().strftime('%Y%m%d_%H%M%S')
 							keywords_str = st.session_state['keywords'].replace(', ', '_').replace(' ', '_')
+							search_year = normalize_search_year(st.session_state.get('search_year', DEFAULT_SEARCH_YEAR))
 							page_downloads = st.session_state.get('page_downloads', {})
 							page_downloads[current_page] = {
 								'data': zip_bytes,
-								'filename': f'{keywords_str}_{now}.zip',
+								'filename': build_year_prefixed_filename(f'{keywords_str}_{now}', search_year, 'zip'),
 								'mime': 'application/zip',
 								'target_indices': list(selected_idxs),
 								'download_completed': False,
@@ -2729,6 +3509,10 @@ def main_ui(tab_mode=False):
 					else:
 						st.session_state['file_generation_started'] = False
 						st.session_state['active_generation_indices'] = []
+				else:
+					st.toast('업체를 선택해 주세요.', icon='⚠️')
+					st.session_state['file_generation_started'] = False
+					st.session_state['active_generation_indices'] = []
 
 		render_interactive_table()
 
