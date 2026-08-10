@@ -2377,7 +2377,8 @@ def _build_summary_tables(ws, hazard_df):
 			review_count += 1
 
 	# 영업비밀율(%) 계산
-	secret_ratio = f"{round((secret_count / total_count) * 100)}%" if total_count > 0 else "0%"
+	#secret_ratio = f"{round((secret_count / total_count) * 100)}%" if total_count > 0 else "0%" closed 260810
+	secret_ratio = f"{round(((secret_count + review_count) / total_count) * 100)}%" if total_count > 0 else "0%" # 260810 영업비밀+심사중
 
 	# 표5 헤더 생성
 	table5_headers = ['영업비밀', '#']
@@ -2599,7 +2600,7 @@ def main_ui(tab_mode=False):
 	with col_ver:
 		st.markdown(
 			"""<div style="text-align: right; color: #999; font-size: 15px; margin-top: 10px;">
-			v2.260724
+			v2.260810
 			</div>""",
 			unsafe_allow_html=True,
 		)
