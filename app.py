@@ -2058,7 +2058,8 @@ def _build_summary_tables(ws, hazard_df):
 		cell.border = thin_border
 		cell.fill = fill_header
 
-	row_labels = ['구분1', '1A', '1B', '구분2', '구분3', '구분4', '기타구분', '유해물질수', '분석물질수', '유해물질비율']
+	#row_labels = ['구분1', '1A', '1B', '구분2', '구분3', '구분4', '기타구분', '유해물질수', '분석물질수', '유해물질비율']
+	row_labels = ['구분1', '구분1A', '구분1B', '구분2', '구분3', '구분4', '기타구분', '유해물질수', '분석물질수', '유해물질비율']  # 260901 표기명 변경
 	cmr_agg_cols = {'CMR'}
 	general_agg_cols = {agg_col for agg_col, _ in AGGREGATE_GROUPS}
 	cmr_source_cols = {'발암성', '생식독성', '생식세포 변이원성'}
@@ -2079,7 +2080,8 @@ def _build_summary_tables(ws, hazard_df):
 				continue
 
 			if hazard in cmr_agg_cols:
-				label_map = {'1A': '1A', '1B': '1B', '2': '구분2'}
+				#label_map = {'1A': '1A', '1B': '1B', '2': '구분2'}
+				label_map = {'1A': '구분1A', '1B': '구분1B', '2': '구분2'}  # 260901 표기명 변경
 				count_map[label_map.get(val_str, '기타구분')] += 1
 			elif hazard in general_agg_cols:
 				label_map = {'1': '구분1', '2': '구분2', '3': '구분3', '4': '구분4'}
@@ -2087,7 +2089,8 @@ def _build_summary_tables(ws, hazard_df):
 			elif hazard in cmr_source_cols:
 				grades = extract_cmr_grades(val_str)
 				most_severe = get_highest_cmr_grade(grades)
-				label_map = {'1A': '1A', '1B': '1B', '2': '구분2'}
+				#label_map = {'1A': '1A', '1B': '1B', '2': '구분2'}
+				label_map = {'1A': '구분1A', '1B': '구분1B', '2': '구분2'}  # 260901 표기명 변경
 				if most_severe:
 					count_map[label_map.get(most_severe, '기타구분')] += 1
 			else:
@@ -2600,7 +2603,7 @@ def main_ui(tab_mode=False):
 	with col_ver:
 		st.markdown(
 			"""<div style="text-align: right; color: #999; font-size: 15px; margin-top: 10px;">
-			v2.260810
+			v2.260901
 			</div>""",
 			unsafe_allow_html=True,
 		)
