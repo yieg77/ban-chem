@@ -3416,13 +3416,7 @@ def main_ui(tab_mode=False):
 						bplc_id = item_data.get('bplcId', '')
 						company_name = item_data.get('company_name', '')
 						region = item_data.get('region', '')
-						company_name_key = company_name
-						global_same_name_count = sum(
-							1
-							for row in search_results
-							if row.get('company_name', '') == company_name_key
-						)
-						use_region = global_same_name_count > 1 or item_data.get('use_region_in_filename', False)
+						use_region = bool(region)
 
 						if bplc_id and '검색 결과 없음' not in company_name:
 							try:
