@@ -352,7 +352,7 @@ def extract_region_from_address(address):
 
 	region = match.group(1)
 	if region.endswith('특별자치시'):
-		return region[:-6]
+		return region[:-5]
 	if region.endswith('광역시') or region.endswith('특별시'):
 		return region[:-3]
 	return region[:-1]
@@ -1896,7 +1896,9 @@ async def _query_cas_info_async(data_rows, service_key, progress_callback=None):
 	completed = 0
 
 	semaphore = asyncio.Semaphore(ASYNC_MAX_CONCURRENCY)
-	timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
+	#timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15) # closed 260906 지연 응답에 대한 타임아웃 설정
+	timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=30)  # 260906 지연 응답에 대한 타임아웃 설정
+
 	connector = aiohttp.TCPConnector(limit=ASYNC_MAX_CONCURRENCY)
 
 	async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -2603,7 +2605,7 @@ def main_ui(tab_mode=False):
 	with col_ver:
 		st.markdown(
 			"""<div style="text-align: right; color: #999; font-size: 15px; margin-top: 10px;">
-			v2.260901
+			v2.260906
 			</div>""",
 			unsafe_allow_html=True,
 		)
